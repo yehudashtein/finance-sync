@@ -90,7 +90,7 @@ if (!credentials) {
 const lookback = Number(env.ISRAEL_LOOKBACK_DAYS || 365);
 const startDate = new Date(Date.now() - lookback * 86400000);
 
-const scraper = company.factory({
+const scraperOpts = {
   companyId: company.companyId,
   startDate,
   combineInstallments: false,
@@ -98,7 +98,14 @@ const scraper = company.factory({
   includeRawTransaction: true,
   // On failure, save what the page looked like (git-ignored data/ dir).
   storeFailureScreenShotPath: resolve(here, '..', 'data', `${name}-failure.png`),
-});
+};
+// In a container, Chrome (official lib: Max/Isracard) refuses to run as root
+// without --no-sandbox. Camoufox (Firefox: One Zero/Pepper) runs fine as root,
+// and the flag isn't a Firefox arg, so only apply it to the Chrome scrapers.
+if (env.BROWSER_NO_SANDBOX === '1' && company.factory === createScraper) {
+  scraperOpts.args = ['--no-sandbox', '--disable-setuid-sandbox'];
+}
+const scraper = company.factory(scraperOpts);
 // Keep the event loop alive across the scrape: the Camoufox launch (Pepper) has a
 // window with no active libuv handle, during which a bare top-level await would
 // let Node exit before scrape() settles.
