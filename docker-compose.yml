@@ -1,0 +1,29 @@
+# Convenience wrapper. Chase is NOT run here (needs host Chrome) — run it natively.
+#
+#   docker compose build
+#   docker compose run --rm sync                 # sync max isracard onezero pepper
+#   docker compose run --rm sync max pepper      # selected sources
+#   docker compose run --rm setup pepper-setup   # one-time SMS setup (interactive)
+#   docker compose run --rm setup onezero-setup
+services:
+  sync:
+    build: .
+    # host networking so One Zero / Pepper egress follows the host route
+    # (e.g. a Tailscale exit node). On Docker Desktop (Windows/Mac) host mode is
+    # limited — see DOCKER.md if those two get geo-blocked.
+    network_mode: host
+    volumes:
+      - ./.env:/app/.env
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  setup:
+    build: .
+    network_mode: host
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./.env:/app/.env
+      - ./logs:/app/logs
+    entrypoint: ["npm", "--prefix", "israel", "run"]
+    command: ["pepper-setup"]

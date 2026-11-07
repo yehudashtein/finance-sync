@@ -1,0 +1,14 @@
+.env
+data/
+inbox/
+chrome-debug-profile/
+.venv/
+__pycache__/
+*.pyc
+israel/node_modules/
+vendor/onezero-pr/node_modules/
+vendor/pepper-fork/node_modules/
+logs/
+israel/vendor/
+CARDS.md
+*-failure.png

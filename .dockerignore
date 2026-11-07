@@ -1,0 +1,16 @@
+# Keep the build context small and force a clean in-container rebuild.
+# setup.sh re-creates the vendored forks, node deps and venv for Linux.
+.venv/
+data/
+logs/
+inbox/
+chrome-debug-profile/
+israel/node_modules/
+israel/vendor/
+**/__pycache__/
+*.pyc
+.git/
+.env
+CARDS.md
+*-failure.png
+patches/*.rej

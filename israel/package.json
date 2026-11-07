@@ -1,0 +1,17 @@
+{
+  "name": "finance-israel-scrapers",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "dotenv": "16.4.5",
+    "isb-onezero": "file:vendor/onezero-pr",
+    "isb-pepper": "file:vendor/pepper-fork",
+    "israeli-bank-scrapers": "6.12.2",
+    "node": "22.23.2"
+  },
+  "scripts": {
+    "onezero-setup": "node onezero-setup.mjs",
+    "scrape": "node scrape.mjs",
+    "pepper-setup": "node pepper-setup.mjs"
+  }
+}

@@ -1,0 +1,522 @@
+diff --git a/src/Scrapers/Pipeline/Banks/Pepper/graphql/PepperQueries.ts b/src/Scrapers/Pipeline/Banks/Pepper/graphql/PepperQueries.ts
+index f381113..4dd6887 100644
+--- a/src/Scrapers/Pipeline/Banks/Pepper/graphql/PepperQueries.ts
++++ b/src/Scrapers/Pipeline/Banks/Pepper/graphql/PepperQueries.ts
+@@ -38,45 +38,55 @@ query fetchAccountBalance($accountId: String!) {
+ }
+ `;
+ 
++// Pepper removed `oshTransactionsNew` (it now returns a downstream HTTP 400);
++// the current API exposes `oshTransactionsPagination`, paginated by
++// `nextTransactionSerialNumber`. The first page sends only { accountId }.
+ const TRANSACTIONS = `
+ query Transactions(
+   $accountId: String!
+-  $from: String
+-  $to: String
+-  $pageNumber: Int
+-  $pageCount: Int
++  $nextTransactionSerialNumber: Int
+ ) {
+   accounts {
+-    oshTransactionsNew(
++    oshTransactionsPagination(
+       accountId: $accountId
+-      from: $from
+-      to: $to
+-      pageNumber: $pageNumber
+-      pageCount: $pageCount
++      nextTransactionSerialNumber: $nextTransactionSerialNumber
+     ) {
+       totalCount
++      nextTransactionSerialNumber
+       transactions {
+         transactionId
++        transactionSerialNumber
+         transactionAmount
++        currency
+         bookingDate
+         effectiveDate
+-        currency
++        processingDate
+         description
+         title
+         subTitle
+         referenceNumber
++        runningBalance
++        transactionCategory
++        pepperMainTransactionType
++        status
+         liquidityStatus
+       }
+       pendingTransactions {
+         transactionId
++        transactionSerialNumber
+         transactionAmount
++        currency
+         bookingDate
+         effectiveDate
+-        currency
++        processingDate
+         description
+         title
+         subTitle
+         referenceNumber
++        runningBalance
++        transactionCategory
++        pepperMainTransactionType
++        status
+         liquidityStatus
+       }
+     }
+diff --git a/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeHelpers.ts b/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeHelpers.ts
+index 9a3a7be..18519c2 100644
+--- a/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeHelpers.ts
++++ b/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeHelpers.ts
+@@ -48,7 +48,12 @@ interface IBalanceResp {
+ export function extractAccounts(args: IExtractAccountsArgs): readonly IPepperAcct[] {
+   const resp = args.body as unknown as ICustomerResp;
+   const customers = resp.userDataV2?.getUserDataV2?.customerAndAccounts ?? [];
+-  return customers.flatMap((c): readonly IPepperAcct[] => c.accounts ?? []);
++  const all = customers.flatMap((c): readonly IPepperAcct[] => c.accounts ?? []);
++  // Only the shekel current account carries oshTransactionsPagination / balance;
++  // Foreign and SecuritiesAccount return a downstream 400. Scrape Ils, falling
++  // back to all accounts if the category field ever changes shape.
++  const ils = all.filter((a): boolean => a.accountCategory === 'Ils');
++  return ils.length > 0 ? ils : all;
+ }
+ 
+ /**
+diff --git a/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeTxns.ts b/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeTxns.ts
+index 23cd53a..ce78525 100644
+--- a/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeTxns.ts
++++ b/src/Scrapers/Pipeline/Banks/Pepper/scrape/PepperShapeTxns.ts
+@@ -1,6 +1,9 @@
+ /**
+- * Pepper scrape shape — transactions helpers (cursor, pagination merge).
+- * Split from PepperShapeHelpers.ts to respect the 150-LOC ceiling.
++ * Pepper scrape shape — transactions helpers.
++ *
++ * Pepper paginates transactions via `oshTransactionsPagination`, walking back in
++ * time with the cursor `nextTransactionSerialNumber` (the first page sends only
++ * { accountId }). Amounts are already signed (debits negative).
+  */
+ 
+ import moment from 'moment';
+@@ -10,125 +13,73 @@ import type {
+   VarsMap,
+ } from '../../../Phases/ApiDirectScrape/IApiDirectScrapeShape.js';
+ import type { IPage } from '../../../Strategy/Fetch/Pagination.js';
+-import type { Brand } from '../../../Types/Brand.js';
+ import type { IActionContext } from '../../../Types/PipelineContext.js';
+ import type { IPepperAcct } from './PepperShapeHelpers.js';
+ 
+-/** 1-based pagination page number — branded for Rule #15. */
+-type PageNumber = Brand<number, 'PepperPageNumber'>;
+-/** Last-page predicate result — branded for Rule #15. */
+-type IsLastPage = Brand<boolean, 'PepperIsLastPage'>;
+-
+ const ISO_DATE_FMT = 'YYYY-MM-DD';
+-/** Page-size limit for transactions pagination. */
+-export const PAGE_SIZE = 100;
+-const FIRST_PAGE = 1;
+ 
+ type PepperTxn = Record<string, unknown>;
+ 
+ interface IOshBlock {
+   readonly totalCount?: number;
++  readonly nextTransactionSerialNumber?: number | null;
+   readonly transactions?: readonly PepperTxn[];
+   readonly pendingTransactions?: readonly PepperTxn[];
+ }
+ interface ITxnsResp {
+-  readonly accounts?: { readonly oshTransactionsNew?: IOshBlock };
+-}
+-
+-/** Scrape window (from/to ISO strings). */
+-export interface IWindow {
+-  readonly from: string;
+-  readonly to: string;
+-}
+-
+-/**
+- * Compute the scrape window from ScraperOptions.startDate.
+- * @param ctx - Action context.
+- * @returns from/to ISO strings.
+- */
+-export function windowOf(ctx: IActionContext): IWindow {
+-  const from = moment(ctx.options.startDate).format(ISO_DATE_FMT);
+-  const to = moment().format(ISO_DATE_FMT);
+-  return { from, to };
++  readonly accounts?: { readonly oshTransactionsPagination?: IOshBlock };
+ }
+ 
+ /**
+- * Resolve the 1-based page number for the request.
+- * @param cursor - Incoming cursor (false on first call).
+- * @returns Page number.
+- */
+-export function pageNumberOf(cursor: number | false): PageNumber {
+-  if (cursor === false) return FIRST_PAGE as PageNumber;
+-  return cursor as PageNumber;
+-}
+-
+-/**
+- * Build txns variables for one page.
++ * Build txns variables for one page. First page: just the account id.
++ * Later pages carry the serial-number cursor returned by the previous page.
+  * @param acct - Pepper account.
+- * @param cursor - Cursor (false on first call).
+- * @param ctx - Action context.
++ * @param cursor - Serial-number cursor (false on the first call).
+  * @returns Variables map.
+  */
+-export function txnsVars(acct: IPepperAcct, cursor: number | false, ctx: IActionContext): VarsMap {
+-  const window = windowOf(ctx);
+-  const pageNumber = pageNumberOf(cursor);
+-  const { accountId } = acct;
+-  return { accountId, from: window.from, to: window.to, pageNumber, pageCount: PAGE_SIZE };
++export function txnsVars(acct: IPepperAcct, cursor: number | false): VarsMap {
++  if (cursor === false) return { accountId: acct.accountId };
++  return { accountId: acct.accountId, nextTransactionSerialNumber: cursor };
+ }
+ 
+-/**
+- * Terminate when empty, under-page, or cumulative coverage meets totalCount.
+- * @param rows - Rows on the current page.
+- * @param page - Page number just fetched.
+- * @param total - Server-declared totalCount.
+- * @returns True when pagination should stop.
+- */
+-export function isLastPage(rows: number, page: number, total: number): IsLastPage {
+-  if (rows === 0) return true as IsLastPage;
+-  if (rows < PAGE_SIZE) return true as IsLastPage;
+-  return (page * PAGE_SIZE >= total) as IsLastPage;
+-}
+-
+-/**
+- * Resolve next cursor — false when done, else page+1.
+- * @param isDone - Whether pagination should stop after this page.
+- * @param page - Page number just fetched.
+- * @returns Next cursor value.
+- */
+-function nextCursorOf(isDone: boolean, page: number): number | false {
+-  if (isDone) return false;
+-  return page + 1;
+-}
+-
+-/**
+- * Merge posted + pending rows into one page.
+- * @param osh - Optional oshTransactionsNew block.
+- * @returns Merged rows (empty when block is missing).
+- */
++/** Merge posted + pending rows into one page (futures are not yet real). */
+ function mergeRows(osh?: IOshBlock): readonly PepperTxn[] {
+   const posted = osh?.transactions ?? [];
+   const pending = osh?.pendingTransactions ?? [];
+   return [...posted, ...pending];
+ }
+ 
++/** Earliest bookingDate on the page, or null when none parse. */
++function oldestDate(rows: readonly PepperTxn[]): moment.Moment | null {
++  const dates = rows
++    .map((r) => moment(String(r.bookingDate ?? r.effectiveDate ?? '')))
++    .filter((m) => m.isValid());
++  if (dates.length === 0) return null;
++  return moment.min(dates);
++}
++
+ /**
+- * Extract one page from the unwrapped Transactions response.
+- *
+- * Signature matches the unified scrape-shape contract: takes a full
+- * {@link IExtractPageArgs} bundle. Pepper uses `args.body` +
+- * `args.cursor`; banks that need the per-account context (PayBox)
+- * read `args.acct` / `args.ctx`.
+- * @param args - Bundle carrying body + cursor + acct + ctx.
++ * Extract one page from the Transactions response and decide the next cursor.
++ * Stops when the server returns no further cursor, the page is empty, or the
++ * page has reached back past ScraperOptions.startDate.
++ * @param args - Bundle carrying body + cursor + ctx.
+  * @returns Page rows + nextCursor.
+  */
+ export function txnsExtractPage(
+   args: IExtractPageArgs<IPepperAcct, number>,
+ ): IPage<object, number> {
+   const resp = args.body as unknown as ITxnsResp;
+-  const osh = resp.accounts?.oshTransactionsNew;
++  const osh = resp.accounts?.oshTransactionsPagination;
+   const rows = mergeRows(osh);
+-  const page = pageNumberOf(args.cursor);
+-  const total = osh?.totalCount ?? 0;
+-  const isDone = isLastPage(rows.length, page, total);
+-  return { items: rows, nextCursor: nextCursorOf(isDone, page) };
++  const nextSerial = osh?.nextTransactionSerialNumber;
++
++  const ctx = args.ctx as IActionContext;
++  const startDate = moment(ctx.options.startDate).format(ISO_DATE_FMT);
++  const oldest = oldestDate(rows);
++  const reachedStart = oldest !== null && oldest.format(ISO_DATE_FMT) < startDate;
++
++  const hasNext = typeof nextSerial === 'number' && nextSerial > 0;
++  const nextCursor: number | false =
++    rows.length === 0 || reachedStart || !hasNext ? false : (nextSerial as number);
++  return { items: rows, nextCursor };
+ }
+diff --git a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/ConfigContracts/ApiDirectCallConfig.ts b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/ConfigContracts/ApiDirectCallConfig.ts
+index ce972a9..4e38a30 100644
+--- a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/ConfigContracts/ApiDirectCallConfig.ts
++++ b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/ConfigContracts/ApiDirectCallConfig.ts
+@@ -50,6 +50,16 @@ interface IApiDirectCallConfig {
+   readonly authScheme?: AuthScheme;
+   /** Optional warm-start shortcut — see IWarmStartConfig for semantics. */
+   readonly warmStart?: IWarmStartConfig;
++  /**
++   * Optional device re-auth path. When no fresh long-term token is available
++   * but all `credsFields` are present (e.g. a persisted device id + keypair
++   * from a prior bind), run `steps` from index 0 instead of the cold steps —
++   * for banks whose returning-device login skips SMS (password only).
++   */
++  readonly deviceReauth?: {
++    readonly credsFields: readonly string[];
++    readonly steps: readonly IStepConfig[];
++  };
+   /**
+    * Static cryptographic literals accessible via `config.secrets.<name>`
+    * RefTokens. Public-extractable constants (signing keys lifted from
+diff --git a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Crypto/CryptoKeyFactory.ts b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Crypto/CryptoKeyFactory.ts
+index 090162d..5772c61 100644
+--- a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Crypto/CryptoKeyFactory.ts
++++ b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Crypto/CryptoKeyFactory.ts
+@@ -7,7 +7,7 @@
+  */
+ 
+ import type { KeyObject } from 'node:crypto';
+-import { createHash, generateKeyPairSync } from 'node:crypto';
++import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
+ 
+ import { ScraperErrorTypes } from '../../../../Base/ErrorTypes.js';
+ import type { Procedure } from '../../../Types/Procedure.js';
+@@ -88,6 +88,23 @@ function generateKeypair(algorithm: SignerAlgorithm): Procedure<IGenericKeypair>
+   return factory();
+ }
+ 
++/**
++ * Rebuild an IGenericKeypair from a persisted PKCS#8 private-key PEM.
++ * The derived public key (and thus key-id) is deterministic, so a device
++ * re-auth reuses exactly the key registered at bind.
++ * @param privateKeyPem - PKCS#8 PEM string.
++ * @returns IGenericKeypair Procedure.
++ */
++function importKeypair(privateKeyPem: string): Procedure<IGenericKeypair> {
++  try {
++    const privateKey = createPrivateKey(privateKeyPem);
++    const publicKey = createPublicKey(privateKey);
++    return succeed(packKeypair(privateKey, publicKey));
++  } catch (e) {
++    return fail(ScraperErrorTypes.Generic, `failed to import keypair: ${(e as Error).message}`);
++  }
++}
++
+ export type { IGenericKeypair };
+ export default generateKeypair;
+-export { generateKeypair };
++export { generateKeypair, importKeypair };
+diff --git a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/SmsOtpFlow.prep.ts b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/SmsOtpFlow.prep.ts
+index 784eedf..9a094d9 100644
+--- a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/SmsOtpFlow.prep.ts
++++ b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/SmsOtpFlow.prep.ts
+@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
+ 
+ import type { Procedure } from '../../../Types/Procedure.js';
+ import { isOk, succeed } from '../../../Types/Procedure.js';
+-import { generateKeypair } from '../Crypto/CryptoKeyFactory.js';
++import { generateKeypair, importKeypair } from '../Crypto/CryptoKeyFactory.js';
+ import type { JsonValue } from '../Envelope/JsonPointer.js';
+ import type { ICollectionResult } from '../Fingerprint/GenericFingerprintBuilder.js';
+ import { buildCollectionResult } from '../Fingerprint/GenericFingerprintBuilder.js';
+@@ -27,12 +27,19 @@ import type {
+  * @param config - API-direct-call config.
+  * @returns Procedure with keypair bundle (empty when no signer or AES).
+  */
+-function prepareKeypairs(config: IApiDirectCallConfig): Procedure<IKeypairBundle> {
++function keyFromCredsOrGenerate(pem: unknown, algo: 'ECDSA-P256' | 'RSA-2048') {
++  return typeof pem === 'string' && pem.length > 0 ? importKeypair(pem) : generateKeypair(algo);
++}
++
++function prepareKeypairs(
++  config: IApiDirectCallConfig,
++  creds: Readonly<Record<string, unknown>>,
++): Procedure<IKeypairBundle> {
+   if (config.signer === undefined) return succeed({});
+   if (config.signer.algorithm === 'AES-CBC-PKCS7') return succeed({});
+-  const ecProc = generateKeypair('ECDSA-P256');
++  const ecProc = keyFromCredsOrGenerate(creds.ecPrivateKeyPem, 'ECDSA-P256');
+   if (!isOk(ecProc)) return ecProc;
+-  const rsaProc = generateKeypair('RSA-2048');
++  const rsaProc = keyFromCredsOrGenerate(creds.rsaPrivateKeyPem, 'RSA-2048');
+   if (!isOk(rsaProc)) return rsaProc;
+   return succeed({ ec: ecProc.value, rsa: rsaProc.value });
+ }
+@@ -110,7 +117,7 @@ function buildSmsOtpCarry(args: IRunSmsOtpArgs): Procedure<Readonly<Record<strin
+  * @returns Core inputs procedure.
+  */
+ function prepCoreInputs(args: IRunSmsOtpArgs): Procedure<ICoreSmsOtpInputs> {
+-  const keypairsProc = prepareKeypairs(args.config);
++  const keypairsProc = prepareKeypairs(args.config, args.creds as Readonly<Record<string, unknown>>);
+   if (!isOk(keypairsProc)) return keypairsProc;
+   const fpProc = prepareFingerprint(args.config);
+   if (!isOk(fpProc)) return fpProc;
+diff --git a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/TokenStrategyFromConfig.flow.ts b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/TokenStrategyFromConfig.flow.ts
+index ed1c85c..ef79821 100644
+--- a/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/TokenStrategyFromConfig.flow.ts
++++ b/src/Scrapers/Pipeline/Mediator/ApiDirectCall/Flow/TokenStrategyFromConfig.flow.ts
+@@ -90,13 +90,40 @@ async function runConfiguredFlow(
+  * @param args - Config + bus + ctx + creds + capture slot.
+  * @returns Header-value procedure.
+  */
++function pickDeviceReauthArgs(
++  config: IApiDirectCallConfig,
++  bus: IPrimeArgs['bus'],
++  creds: GenericCreds,
++  companyId: IPrimeArgs['ctx']['companyId'],
++): IRunFlowArgs | false {
++  const dr = config.deviceReauth;
++  if (dr === undefined) return false;
++  const ready = dr.credsFields.every((f): boolean => typeof creds[f] === 'string' && creds[f] !== '');
++  if (!ready) return false;
++  const drConfig: IApiDirectCallConfig = { ...config, steps: dr.steps };
++  return {
++    config: drConfig,
++    bus,
++    creds,
++    companyId,
++    initialCarry: { deviceId: creds.deviceId as string },
++    startStepIndex: 0,
++  };
++}
++
+ async function primeInitialImpl(args: IPrimeArgs): Promise<Procedure<string>> {
+   const { config, bus, ctx, creds, slot } = args;
+   const stored = pickWarmSeed(config, creds);
+-  slot.usedWarmPath = stored !== false;
+   if (stored === false) {
++    const drArgs = pickDeviceReauthArgs(config, bus, creds, ctx.companyId);
++    if (drArgs !== false) {
++      slot.usedWarmPath = true;
++      return runConfiguredFlow(drArgs, slot);
++    }
++    slot.usedWarmPath = false;
+     return runConfiguredFlow({ config, bus, creds, companyId: ctx.companyId }, slot);
+   }
++  slot.usedWarmPath = true;
+   const warmArgs = makeWarmArgs({ config, bus, creds, stored, companyId: ctx.companyId });
+   return runConfiguredFlow(warmArgs, slot);
+ }
+diff --git a/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfig.ts b/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfig.ts
+index a16c50f..a212ad2 100644
+--- a/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfig.ts
++++ b/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfig.ts
+@@ -186,6 +186,7 @@ const PIPELINE_BANK_CONFIG: Partial<Record<CompanyTypes, IPipelineBankConfig>> =
+       graphql: 'https://fe-sec.pepper.co.il/graphql',
+       paths: {
+         'auth.bind': 'https://sa.pepper.co.il/api/v2/auth/bind',
++        'auth.login': 'https://sa.pepper.co.il/api/v2/auth/login',
+         'auth.assert': 'https://sa.pepper.co.il/api/v2/auth/assert',
+         'auth.logout': 'https://sa.pepper.co.il/api/v2/auth/logout',
+       },
+diff --git a/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepper.ts b/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepper.ts
+index d4a7bd1..496e732 100644
+--- a/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepper.ts
++++ b/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepper.ts
+@@ -22,7 +22,13 @@ import {
+   STATIC_HEADERS,
+   TS_CLIENT_VERSION,
+ } from './PipelineBankConfigPepperFingerprint.js';
+-import { ASSERT_OTP_STEP, ASSERT_PWD_STEP, BIND_STEP } from './PipelineBankConfigPepperSteps.js';
++import {
++  ASSERT_OTP_STEP,
++  ASSERT_PWD_LOGIN_STEP,
++  ASSERT_PWD_STEP,
++  BIND_STEP,
++  LOGIN_STEP,
++} from './PipelineBankConfigPepperSteps.js';
+ 
+ /** Pepper config literal — seeded into PIPELINE_BANK_CONFIG[PEPPER]. */
+ const PEPPER_API_DIRECT_CALL: IApiDirectCallConfig = {
+@@ -53,6 +59,12 @@ const PEPPER_API_DIRECT_CALL: IApiDirectCallConfig = {
+   fingerprint: PEPPER_FINGERPRINT,
+   probe: { queryTag: 'customer' },
+   steps: [BIND_STEP, ASSERT_PWD_STEP, ASSERT_OTP_STEP],
++  // Returning-device re-auth (no SMS): requires a persisted device id + the
++  // EC/RSA keypair registered at bind. Runs login -> assert(password) -> token.
++  deviceReauth: {
++    credsFields: ['deviceId', 'ecPrivateKeyPem', 'rsaPrivateKeyPem'],
++    steps: [LOGIN_STEP, ASSERT_PWD_LOGIN_STEP],
++  },
+ };
+ 
+ export { PEPPER_API_DIRECT_CALL };
+diff --git a/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepperSteps.ts b/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepperSteps.ts
+index a7cd3aa..60e3a60 100644
+--- a/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepperSteps.ts
++++ b/src/Scrapers/Pipeline/Registry/Config/PipelineBankConfigPepperSteps.ts
+@@ -147,4 +147,57 @@ const ASSERT_OTP_STEP = {
+   cookieJar: true,
+ };
+ 
+-export { ASSERT_OTP_STEP, ASSERT_PWD_STEP, BIND_STEP };
++/**
++ * Warm Step 1: /auth/login — returning, already-registered device. No SMS.
++ * Unlike bind it sends NO public_key (the device key is already registered;
++ * Pepper verifies the Content-Signature against it), carries `did` in the
++ * query, and its assert(password) returns the token directly. The signing
++ * keypair MUST be the one registered at bind (injected from creds).
++ */
++const LOGIN_STEP = {
++  name: 'login' as const,
++  urlTag: 'auth.login' as const,
++  queryTemplate: {
++    aid: { $literal: AID },
++    did: { $ref: 'carry.deviceId' as const },
++    locale: { $literal: LOCALE },
++    tsm: { $ref: 'nowMs' as const },
++  },
++  body: {
++    shape: {
++      headers: [
++        { type: { $literal: HEADER_TYPE_FLOW_ID }, flow_id: { $ref: FLOW_ID_REF } },
++        { type: { $literal: HEADER_TYPE_UID }, uid: { $ref: PHONE_NUMBER_REF } },
++      ],
++      data: {
++        collection_result: { $ref: 'fingerprint' as const },
++        policy_request_id: { $literal: 'default' },
++        params: {
++          CellPhoneID: { $ref: 'uuid' as const },
++          Version_App: { $literal: APK_VERSION },
++          transactionId: { $ref: 'uuid' as const },
++        },
++      },
++    },
++  },
++  extractsToCarry: {
++    challenge: '/data/challenge',
++    pwdAssertionId: '/data/control_flow/0/methods/?type=password/assertion_id',
++    sessionId: '/headers/*session_id',
++    deviceId: '/headers/*device_id',
++  },
++  cookieJar: true,
++};
++
++/**
++ * Warm Step 2: /auth/assert (method=password) on a registered device —
++ * returns the JWT directly (no SMS). Same as ASSERT_PWD_STEP but it
++ * harvests `/data/token` instead of an SMS assertion id.
++ */
++const ASSERT_PWD_LOGIN_STEP = {
++  ...ASSERT_PWD_STEP,
++  name: 'assertPasswordLogin' as const,
++  extractsToCarry: { token: '/data/token' },
++};
++
++export { ASSERT_OTP_STEP, ASSERT_PWD_LOGIN_STEP, ASSERT_PWD_STEP, BIND_STEP, LOGIN_STEP };
