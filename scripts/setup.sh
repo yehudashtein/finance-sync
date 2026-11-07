@@ -12,22 +12,27 @@ ONEZERO_REF="5af6496"
 PEPPER_REPO="https://github.com/danielbenzvi/israeli-bank-scrapers.git"
 PEPPER_REF="086b7c15"
 
-build_fork() {  # repo ref dest [patch]
-  local repo="$1" ref="$2" dest="$3" patch="${4:-}"
-  if [ -f "$dest/lib/index.mjs" ]; then echo "✓ $dest already built"; return; fi
+build_fork() {  # repo ref dest buildcmd [patch]
+  local repo="$1" ref="$2" dest="$3" buildcmd="$4" patch="${5:-}"
+  if [ -d "$dest/lib" ] && [ -n "$(ls -A "$dest/lib" 2>/dev/null)" ]; then echo "✓ $dest already built"; return; fi
   echo "→ building $dest"
   rm -rf "$dest"; git clone --quiet "$repo" "$dest"
   ( cd "$dest"
     git checkout --quiet "$ref"
     [ -n "$patch" ] && git apply "$patch"
-    npm ci --ignore-scripts --no-audit --no-fund
-    npx tsup )
+    npm ci --ignore-scripts --no-audit --no-fund --include=dev
+    eval "$buildcmd" )
 }
 
+# The two forks have different build systems:
+#   One Zero (RebliNk17 / upstream israeli-bank-scrapers) -> Babel + tsc
+#   Pepper   (@sergienko4 / danielbenzvi)                 -> tsup
 echo "== 1/4 One Zero fork"
-build_fork "$ONEZERO_REPO" "$ONEZERO_REF" "israel/vendor/onezero-pr"
+build_fork "$ONEZERO_REPO" "$ONEZERO_REF" "israel/vendor/onezero-pr" \
+  "npm run build:types && npm run build:js"
 echo "== 2/4 Pepper fork (+ transactions fix & device re-auth patch)"
-build_fork "$PEPPER_REPO" "$PEPPER_REF" "israel/vendor/pepper-fork" "$ROOT/patches/pepper-fork.patch"
+build_fork "$PEPPER_REPO" "$PEPPER_REF" "israel/vendor/pepper-fork" \
+  "./node_modules/.bin/tsup" "$ROOT/patches/pepper-fork.patch"
 
 echo "== 3/4 israel deps + better-sqlite3 (N-API, Camoufox needs it)"
 ( cd israel && npm install --no-audit --no-fund && npm rebuild better-sqlite3 )
